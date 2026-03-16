@@ -1,5 +1,3 @@
-#include <Arduino.h>
-
 #define TRIG 9
 #define ECHO 10
 #define BUZZER 8

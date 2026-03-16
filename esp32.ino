@@ -3,11 +3,103 @@
 String targetSSID = "";
 bool tracking = false;
 
-unsigned long lastScan = 0;
-const unsigned long SCAN_INTERVAL_MS = 3000;
+unsigned long lastScanRequest = 0;
+const unsigned long SCAN_INTERVAL_MS = 700;
+
+bool scanRunning = false;
+int latestRssi = -100;
+float filteredRssi = -100.0;
+bool rssiInitialized = false;
+bool nearMode = false;
+
+String distanceLine = "";
 
 float ultrasonicDistance = 100;
 char lastCommand = '\0';
+
+const int RSSI_NEAR_ENTER = -62;
+const int RSSI_FAR_ENTER = -68;
+const float RSSI_ALPHA = 0.35f;
+
+void requestScan()
+{
+    if (scanRunning)
+    {
+        return;
+    }
+
+    WiFi.scanDelete();
+    WiFi.scanNetworks(true, false);
+    scanRunning = true;
+    lastScanRequest = millis();
+}
+
+void processScanResult()
+{
+    if (!scanRunning)
+    {
+        return;
+    }
+
+    int scanStatus = WiFi.scanComplete();
+    if (scanStatus == WIFI_SCAN_RUNNING || scanStatus == -1)
+    {
+        return;
+    }
+
+    scanRunning = false;
+    latestRssi = -100;
+
+    if (scanStatus <= 0)
+    {
+        return;
+    }
+
+    for (int i = 0; i < scanStatus; i++)
+    {
+        if (WiFi.SSID(i) == targetSSID)
+        {
+            latestRssi = WiFi.RSSI(i);
+            break;
+        }
+    }
+
+    if (!rssiInitialized)
+    {
+        filteredRssi = latestRssi;
+        rssiInitialized = true;
+    }
+    else
+    {
+        filteredRssi = (RSSI_ALPHA * latestRssi) + ((1.0f - RSSI_ALPHA) * filteredRssi);
+    }
+}
+
+void readUltrasonicDistance()
+{
+    while (Serial2.available())
+    {
+        char c = (char)Serial2.read();
+
+        if (c == '\n')
+        {
+            if (distanceLine.length() > 0)
+            {
+                ultrasonicDistance = distanceLine.toFloat();
+                distanceLine = "";
+            }
+        }
+        else if (c != '\r')
+        {
+            distanceLine += c;
+
+            if (distanceLine.length() > 16)
+            {
+                distanceLine = "";
+            }
+        }
+    }
+}
 
 void sendCommandIfChanged(char cmd)
 {
@@ -23,6 +115,7 @@ void setup()
 
     Serial.begin(115200);
     Serial2.begin(9600, SERIAL_8N1, 16, 17);
+    Serial.setTimeout(20);
 
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
@@ -80,24 +173,18 @@ void handleUserSelection()
 
     targetSSID = WiFi.SSID(choice);
     tracking = true;
+    rssiInitialized = false;
+    nearMode = false;
 
     Serial.print("Tracking: ");
     Serial.println(targetSSID);
+
+    requestScan();
 }
 
 void loop()
 {
-
-    // receive ultrasonic data
-    if (Serial2.available())
-    {
-        String distanceStr = Serial2.readStringUntil('\n');
-        distanceStr.trim();
-        if (distanceStr.length() > 0)
-        {
-            ultrasonicDistance = distanceStr.toFloat();
-        }
-    }
+    readUltrasonicDistance();
 
     // ultrasonic override
     if (ultrasonicDistance < 5)
@@ -112,11 +199,11 @@ void loop()
     {
         sendCommandIfChanged('S');
 
-        if (millis() - lastScan >= SCAN_INTERVAL_MS)
+        if (millis() - lastScanRequest >= SCAN_INTERVAL_MS)
         {
             scanNetworks();
             Serial.println("Enter network number:");
-            lastScan = millis();
+            lastScanRequest = millis();
         }
 
         handleUserSelection();
@@ -124,43 +211,35 @@ void loop()
 
     else
     {
-
-        int n = WiFi.scanNetworks();
-        bool foundTarget = false;
-        int targetRssi = -100;
-
-        for (int i = 0; i < n; i++)
+        if (millis() - lastScanRequest >= SCAN_INTERVAL_MS)
         {
-
-            if (WiFi.SSID(i) == targetSSID)
-            {
-                foundTarget = true;
-                targetRssi = WiFi.RSSI(i);
-                break;
-            }
+            requestScan();
         }
 
-        if (!foundTarget)
+        processScanResult();
+
+        if (!rssiInitialized)
         {
-            Serial.println("Target network not found. Buzzer stopped.");
             sendCommandIfChanged('S');
             return;
         }
 
-        Serial.print("RSSI: ");
-        Serial.print(targetRssi);
+        Serial.print("RSSI raw: ");
+        Serial.print(latestRssi);
+        Serial.print(" | RSSI filtered: ");
+        Serial.print(filteredRssi, 1);
         Serial.print(" | Ultrasonic: ");
         Serial.println(ultrasonicDistance);
 
-        if (targetRssi > -60)
+        if (!nearMode && filteredRssi >= RSSI_NEAR_ENTER)
         {
-            sendCommandIfChanged('N');
+            nearMode = true;
         }
-        else
+        else if (nearMode && filteredRssi <= RSSI_FAR_ENTER)
         {
-            sendCommandIfChanged('F');
+            nearMode = false;
         }
 
-        delay(400);
+        sendCommandIfChanged(nearMode ? 'N' : 'F');
     }
 }
